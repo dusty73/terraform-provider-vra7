@@ -6,25 +6,23 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
 	"encoding/json"
+
 	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform/helper/resource"
 )
-
-//ResourceActionTemplate - is used to store information
-//related to resource action template information.
-type ResourceActionTemplate struct {
-	Type			string			`json:"type"`
-	ResourceID		string			`json:"resourceId"`
-	ActionID		string			`json:"actionId"`
-	Description		string			`json:"description"`
-	Data			map[string]interface{}	`json:"data"`
-}
-
 
 //ResourceViewsTemplate - is used to store information
 //related to resource template information.
 type ResourceViewsTemplate struct {
-	Content []interface {
+	Content []struct {
+		ResourceID   string `json:"resourceId"`
+		RequestState string `json:"requestState"`
+		Links        []struct {
+			Href string `json:"href"`
+			Rel  string `json:"rel"`
+		} `json:"links"`
 	} `json:"content"`
 	Links []interface{} `json:"links"`
 }
@@ -36,7 +34,25 @@ type RequestStatusView struct {
 		RequestCompletionState string `json:"requestCompletionState"`
 		CompletionDetails      string `json:"CompletionDetails"`
 	} `json:"requestCompletion"`
+	Id string `json:"id"`
 	Phase string `json:"phase"`
+}
+
+//MachineView - used to store reponse of
+//resource data
+type MachineView struct {
+	Content []struct {
+		ResourceID   string `json:"id"`
+		ResourceData struct {
+			Entries []struct {
+				Key   string `json:"key"`
+				Value struct {
+					Type  string `json:"type"`
+					Value interface {} `json:"value"`
+				} `json:"value"`
+			} `json:"entries"`
+		} `json:"resourceData"`
+	} `json:"content"`
 }
 
 //RequestMachineResponse - used to store response of request
@@ -149,6 +165,21 @@ func setResourceSchema() map[string]*schema.Schema {
 				Optional: true,
 				Elem:     schema.TypeString,
 			},
+		},
+		"machine_id": {
+			Type:     schema.TypeString,
+			Computed: true,
+			Optional: true,
+		},
+		"machine_name": {
+			Type:     schema.TypeString,
+			Computed: true,
+			Optional: true,
+		},
+		"ip_address":  {
+			Type:     schema.TypeString,
+			Computed: true,
+			Optional: true,
 		},
 	}
 }
@@ -270,13 +301,15 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 
 	//Update template field values with user configuration
 	resourceConfiguration, _ := d.Get("resource_configuration").(map[string]interface{})
+  log.Printf("Resource configuration before template - %v\n", resourceConfiguration)
 	for configKey := range resourceConfiguration {
+    log.Printf("examining config key: %s", configKey)
 		for dataKey := range keyList {
 			//compare resource list (resource_name) with user configuration fields (resource_name+field_name)
 			if strings.Contains(configKey, keyList[dataKey]) {
 				//If user_configuration contains resource_list element
 				// then split user configuration key into resource_name and field_name
-				splitedArray := strings.Split(configKey, keyList[dataKey]+".")
+				splitedArray := strings.SplitN(configKey, keyList[dataKey]+".", 2)
 				//Function call which changes the template field values with  user values
 				templateCatalogItem.Data[keyList[dataKey]], replaced = changeTemplateValue(
 					templateCatalogItem.Data[keyList[dataKey]].(map[string]interface{}),
@@ -291,26 +324,6 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 		}
 	}
 
-	//Add remaining keys to template vs updating values
-	// first clean out used values
-	for usedKey := range usedConfigKeys {
-		delete(resourceConfiguration, usedConfigKeys[usedKey])
-	}
-	log.Println("Entering Add Loop")
-	for configKey2 := range resourceConfiguration {
-		for dataKey := range keyList {
-			log.Printf("Add Loop: configKey2=[%s] keyList[%d] =[%v]", configKey2, dataKey, keyList[dataKey])
-			if strings.Contains(configKey2, keyList[dataKey]) {
-				splitArray := strings.Split(configKey2, keyList[dataKey]+".")
-				log.Printf("Add Loop Contains %+v", splitArray[1])
-				resourceItem := templateCatalogItem.Data[keyList[dataKey]].(map[string]interface{})
-				resourceItem = addTemplateValue(
-					resourceItem["data"].(map[string]interface{}),
-					splitArray[1],
-					resourceConfiguration[configKey2])
-			}
-		}
-	}
 	//Log print of template after values updated
 	log.Printf("Updated template - %v\n", templateCatalogItem.Data)
 
@@ -325,120 +338,53 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 	//Check if error got while create machine call
 	//If Error is occured, through an exception with an error message
 	if err != nil {
-		return fmt.Errorf("Resource Machine Request Failed: %v", err)
+		return fmt.Errorf("Resource Machine Request %s Failed: %v", requestMachine.ID, err)
+	}
+
+	log.Printf("Resource Machine %s is being provisioned...\n", requestMachine.ID)
+
+	// Poll provisioning status until finished or failed
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"SUBMITTED", "PENDING_PRE_APPROVAL", "IN_PROGRESS", "PENDING_POST_APPROVAL" },
+		Target:     []string{"SUCCESSFUL"},
+		Refresh:    StateRefreshWrapper(requestMachine.ID, meta),
+		Timeout:    40 * time.Minute,
+		Delay:      5 * time.Second,
+		MinTimeout: 3 * time.Second,
+	}
+
+	requestStatus, err2 := stateConf.WaitForState()
+	if err2 != nil {
+		return fmt.Errorf("Error waiting for Machine (%s) to be provisioned: %v", requestMachine.ID, err2)
 	}
 
 	//Set request ID
 	d.SetId(requestMachine.ID)
 	//Set request status
-	d.Set("request_status", "SUBMITTED")
+	d.Set("request_status", requestStatus.(*RequestStatusView).Phase)
+
+	// Update machine state with actual data from provisioned Machine
+	_ = readResource(d, meta)
+
 	return nil
+}
+
+// wrapper for StateChangeConf class
+func StateRefreshWrapper(requestId string, meta interface{}) resource.StateRefreshFunc {
+	return func() (interface{}, string, error) {
+		client := meta.(*APIClient)
+		resourceStatus, err := client.GetRequestStatus(requestId)
+		return resourceStatus, resourceStatus.Phase, err
+	}
 }
 
 //Function use - to update centOS 6.3 machine present in state file
 //Terraform call - terraform refresh
 func updateResource(d *schema.ResourceData, meta interface{}) error {
-	//Get requester machine ID from schema.dataresource
-	requestMachineID := d.Id()
-	//Get client handle
-	client := meta.(*APIClient)
-
-	//If any change made in resource_configuration.
-	if d.HasChange("resource_configuration") {
-		//Read resource template
-		templateResources, errTemplate := client.GetResourceViews(requestMachineID)
-		if errTemplate != nil {
-			return fmt.Errorf("Resource view failed to load:  %v", errTemplate)
-		}
-		//Set URL relation variables.
-		reconfigGetLinkTitle := "GET Template: {com.vmware.csp.component.iaas.proxy.provider@resource.action.name." +
-			"machine.Reconfigure}"
-		reconfigPostLinkTitle := "POST: {com.vmware.csp.component.iaas.proxy.provider@resource.action.name." +
-			"machine.Reconfigure}"
-
-		resourceConfiguration, _ := d.Get("resource_configuration").(map[string]interface{})
-
-		//Iterate over the template content elements
-		for item := range templateResources.Content {
-			mapData := templateResources.Content[item].(map[string]interface{})
-			childData := mapData["data"].(map[string]interface{})
-			childLinks := mapData["links"].([]interface{})
-			//If component is not empty
-			if childData["Component"] != nil {
-				componentName := childData["Component"].(string)
-				log.Println("componentName >> ", componentName)
-				var reconfigGetLink string
-				var reconfigPostLink string
-				//Iterate over the links present in content elements
-				for link := range childLinks {
-					linkInterface := childLinks[link].(map[string]interface{})
-					if linkInterface["rel"] == reconfigGetLinkTitle {
-						//Get resource reconfiguration template link
-						reconfigGetLink = linkInterface["href"].(string)
-					}
-					if linkInterface["rel"] == reconfigPostLinkTitle {
-						//Get resourcce reconfiguration request post link
-						reconfigPostLink = linkInterface["href"].(string)
-					}
-				}
-
-				resourceAction := new(ResourceActionTemplate)
-				apiError := new(APIError)
-				//Get reource child reconfiguration template json
-				response, err := client.HTTPClient.New().Get(reconfigGetLink).
-					Receive(resourceAction, apiError)
-				response.Close = true
-
-				if !apiError.isEmpty() {
-					return apiError
-				}
-				if err != nil {
-					return err
-				}
-				for configKey := range resourceConfiguration {
-					log.Println("--------configKey >> ", configKey)
-					//compare resource list (resource_name) with user configuration fields
-					if strings.Contains(configKey, componentName+".") {
-						//If user_configuration contains resource_list element
-						// then split user configuration key into resource_name and field_name
-						splitedArray := strings.Split(configKey, componentName+".")
-						//actionResponseInterface := actionResponse.(map[string]interface{})
-						//Function call which changes the template field values with  user values
-						log.Println("before change resourceAction.Data => ",resourceAction.Data )
-						//Replace existing values with new values in resource child template
-						resourceAction.Data = changeTemplateValue(
-							resourceAction.Data,
-							splitedArray[1],
-							resourceConfiguration[configKey])
-						log.Println("after change resourceAction.Data => ",resourceAction.Data )
-
-					}
-					//delete used user configuration
-					//delete(resourceConfiguration, configKey)
-				}
-				//If template value got changed then set post call and update resource child
-				resourceAction2 := new(ResourceActionTemplate)
-				apiError2 := new(APIError)
-
-				response2, err2 := client.HTTPClient.New().Post(reconfigPostLink).
-					BodyJSON(resourceAction).Receive(resourceAction2, apiError2)
-
-				if response2.StatusCode != 201 {
-					return apiError2
-				}
-				response2.Close = true
-				if !apiError2.isEmpty() {
-					return apiError2
-				}
-
-				if err2 != nil {
-					return err2
-				}
-			}
-		}
-	}
+	log.Println(d)
 	return nil
 }
+
 //Function use - To read configuration of centOS 6.3 machine present in state file
 //Terraform call - terraform refresh
 func readResource(d *schema.ResourceData, meta interface{}) error {
@@ -449,6 +395,28 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 	//Get requested status
 	resourceTemplate, errTemplate := client.GetRequestStatus(requestMachineID)
 
+	log.Printf("Set additional info retrieved from actual Machine provisioned")
+	//Set additional info retrieved from actual Machine provisioned
+	machineData,errMachineDetail := client.GetMachineDetails(requestMachineID)
+	if errMachineDetail != nil {
+		return fmt.Errorf("Error getting information for Machine (%s): %v", requestMachineID, errMachineDetail)
+	} else {
+		if len(machineData.Content) > 0 {
+			d.Set("machine_id", machineData.Content[0].ResourceID)
+			for i := range machineData.Content[0].ResourceData.Entries {
+				if machineData.Content[0].ResourceData.Entries[i].Key == "ip_address" {
+					d.Set("ip_address", machineData.Content[0].ResourceData.Entries[i].Value.Value.(string))
+				}
+				if machineData.Content[0].ResourceData.Entries[i].Key == "MachineName" {
+					d.Set("machine_name", machineData.Content[0].ResourceData.Entries[i].Value.Value.(string))
+				}
+			}
+		} else {
+			// if machineData.Content is empty it means that the machine has been already destroyed, so we delete the resource
+			d.SetId("")
+		}
+	}
+
 	//Raise an exception if error occured while fetching request status
 	if errTemplate != nil {
 		return fmt.Errorf("Resource view failed to load:  %v", errTemplate)
@@ -456,6 +424,7 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 
 	//Update resource request status in state file
 	d.Set("request_status", resourceTemplate.Phase)
+
 	//If request is failed then set failed message in state file
 	if resourceTemplate.Phase == "FAILED" {
 		d.Set("failed_message", resourceTemplate.RequestCompletion.CompletionDetails)
@@ -497,12 +466,15 @@ func deleteResource(d *schema.ResourceData, meta interface{}) error {
 	if errDestroyAction != nil {
 		return fmt.Errorf("Destory Machine action template failed to load: %v", errDestroyAction)
 	}
+
 	//Set a destroy machine REST call
 	_, errDestroyMachine := client.DestroyMachine(DestroyMachineTemplate, resourceTemplate)
+
 	//Raise an exception if error got while deleting resource
 	if errDestroyMachine != nil {
 		return fmt.Errorf("Destory Machine machine operation failed: %v", errDestroyMachine)
 	}
+
 	//If resource got deleted then unset the resource ID from state file
 	d.SetId("")
 	return nil
@@ -603,6 +575,27 @@ func (c *APIClient) GetResourceViews(ResourceID string) (*ResourceViewsTemplate,
 		return nil, apiError
 	}
 	return resourceViewsTemplate, nil
+}
+
+//GetMachineDetails - To read request status of resource
+// which is used to show information to user post create call.
+func (c *APIClient) GetMachineDetails(ResourceID string) (*MachineView, error) {
+	//Form a URL to read provisioned machine data
+	//first get machine id from request id
+	path := fmt.Sprintf("/catalog-service/api/consumer/requests/%s/resources/?$filter=resourceType/id eq 'Infrastructure.Virtual'", ResourceID)
+	MachineViewData := new(MachineView)
+	apiError := new(APIError)
+	//Set a REST call and fetch a resource request status
+	_, err := c.HTTPClient.New().Get(path).Receive(MachineViewData, apiError)
+	if err != nil {
+		fmt.Errorf("API request %s triggered an error: %v", path, err)
+		return nil, err
+	}
+	if !apiError.isEmpty() {
+		fmt.Errorf("API request %s triggered an error: %v", path, apiError)
+		return nil, apiError
+	}
+	return MachineViewData, nil
 }
 
 //RequestMachine - To set create resource REST call

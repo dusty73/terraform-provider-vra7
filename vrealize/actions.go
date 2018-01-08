@@ -52,14 +52,11 @@ func getactionURL(template *ResourceViewsTemplate, relationVal string) (template
 	l := len(template.Content)
 	//Loop to iterate over the action URLs
 	for i := 0; i < l; i++ {
-		content := template.Content[i].(map[string]interface{})
-		links := content["links"].([]interface{})
-		lengthLinks := len(links)
+		lengthLinks := len(template.Content[i].Links)
 		for j := 0; j < lengthLinks; j++ {
-			linkObj := links[j].(map[string]interface{})
 			//If template action URL matches with given URL then store it in actionURL var
-			if linkObj["rel"] == relationVal {
-				actionURL = linkObj["href"].(string)
+			if template.Content[i].Links[j].Rel == relationVal {
+				actionURL = template.Content[i].Links[j].Href
 			}
 
 		}
