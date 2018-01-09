@@ -334,9 +334,20 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 
 	//Set a  create machine function call
 	requestMachine, err := client.RequestMachine(templateCatalogItem)
+  d.Partial(true)
+	//Set request ID
+	d.SetId(requestMachine.ID)
+	//Set request status
+	d.Set("request_status", requestMachine.Phase)
+
+  d.SetPartial("request_status")
+  d.SetPartial("resource_configuration")
+  d.SetPartial("catalog_configuration")
+  d.SetPartial("businessgroup_id")
+  d.Partial(false)
 
 	//Check if error got while create machine call
-	//If Error is occured, through an exception with an error message
+	//If Error is occured, throw an exception with an error message
 	if err != nil {
 		return fmt.Errorf("Resource Machine Request %s Failed: %v", requestMachine.ID, err)
 	}
@@ -353,19 +364,15 @@ func createResource(d *schema.ResourceData, meta interface{}) error {
 		MinTimeout: 3 * time.Second,
 	}
 
-	requestStatus, err2 := stateConf.WaitForState()
-	if err2 != nil {
-		return fmt.Errorf("Error waiting for Machine (%s) to be provisioned: %v", requestMachine.ID, err2)
-	}
+  requestStatus, err2 := stateConf.WaitForState()
+  d.Set("request_status", requestStatus.(*RequestStatusView).Phase)
 
-	//Set request ID
-	d.SetId(requestMachine.ID)
-	//Set request status
-	d.Set("request_status", requestStatus.(*RequestStatusView).Phase)
+	if err2 != nil {
+		return fmt.Errorf("Error during provisioning of Machine (%s): %v", requestMachine.ID, err2)
+	}
 
 	// Update machine state with actual data from provisioned Machine
 	_ = readResource(d, meta)
-
 	return nil
 }
 
@@ -411,8 +418,10 @@ func readResource(d *schema.ResourceData, meta interface{}) error {
 					d.Set("machine_name", machineData.Content[0].ResourceData.Entries[i].Value.Value.(string))
 				}
 			}
-		} else {
-			// if machineData.Content is empty it means that the machine has been already destroyed, so we delete the resource
+		} else if (d.Get("request_status") == "SUCCESS") {
+			// if machineData.Content is empty but the request is in SUCCESS state
+      // it means that the machine has been already destroyed, so we delete the resource
+      log.Printf("Request status is SUCCESSFUL but no data of provisioned machine, the machine has been destroyed from VRA")
 			d.SetId("")
 		}
 	}
@@ -444,7 +453,7 @@ func deleteResource(d *schema.ResourceData, meta interface{}) error {
 	if len(d.Id()) == 0 {
 		return fmt.Errorf("Resource not found")
 	}
-	//If resource create status is in_progress then skip delete call and through an exception
+	//If resource create status is in_progress then skip delete call and throw an exception
 	if d.Get("request_status").(string) != "SUCCESSFUL" {
 		if d.Get("request_status").(string) == "FAILED" {
 			d.SetId("")
